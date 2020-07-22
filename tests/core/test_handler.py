@@ -35,6 +35,7 @@ from kube_hunter.modules.hunting.kubelet import (
     ProveSystemLogs,
     ReadOnlyKubeletPortHunter,
     SecureKubeletPortHunter,
+    ExposedLogsOnContainerFileSystemHunter,
 )
 from kube_hunter.modules.hunting.mounts import VarLogMountHunter, ProveVarLogMount
 from kube_hunter.modules.hunting.proxy import KubeProxy, ProveProxyExposed, K8sVersionDisclosureProve
@@ -65,6 +66,7 @@ PASSIVE_HUNTERS = {
     VarLogMountHunter,
     KubeProxy,
     AccessSecrets,
+    ExposedLogsOnContainerFileSystemHunter,
 }
 
 ACTIVE_HUNTERS = {

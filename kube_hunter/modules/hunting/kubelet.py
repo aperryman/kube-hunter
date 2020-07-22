@@ -169,6 +169,17 @@ class ExposedKubeletCmdline(Vulnerability, Event):
         self.evidence = f"cmdline: {self.cmdline}"
 
 
+class ExposedLogsOnContainerFileSystem(Vulnerability, Event):
+    """Logs are exposed on the container file system, using the kubelet without authentication"""
+
+    def __init__(self, evidence):
+        Vulnerability.__init__(
+            self, component=Kubelet, name="Exposed Logs On Container File System",
+            category=InformationDisclosure, vid="KHV052",
+        )
+        self.evidence = evidence
+
+
 class KubeletHandlers(Enum):
     # GET
     PODS = "pods"
@@ -1072,3 +1083,102 @@ class ProveSystemLogs(ActiveHunter):
             proctitles.append(bytes.fromhex(proctitle).decode("utf-8").replace("\x00", " "))
         self.event.proctitles = proctitles
         self.event.evidence = f"audit log: {proctitles}"
+
+
+@handler.subscribe(AnonymousAuthEnabled)
+class ExposedLogsOnContainerFileSystemHunter(Hunter):
+    """Kubelet Logs On Container File System Hunter
+    Retrieves log file contents on the file system of the container
+    """
+
+    FIND_CMD_ERROR_MESSAGES = ["No such file or directory", "exited with"]
+
+    def __init__(self, event):
+        self.event = event
+        self.base_url = f"https://{self.event.host}:10250"
+
+    def execute(self):
+        config = get_config()
+
+        found_pods = self._find_all_pods(config)
+
+        if found_pods:
+            message_to_publish = self._execute_exposed_pods_logs_hunter(config, found_pods)
+
+            if message_to_publish:
+                self.publish_event(ExposedLogsOnContainerFileSystem(evidence=message_to_publish))
+
+    def _execute_exposed_pods_logs_hunter(self, config, found_pods):
+        for pod_data in found_pods:
+            pod_namespace = pod_data["metadata"]["namespace"]
+            pod_id = pod_data["metadata"]["name"]
+
+            for container_data in pod_data["spec"]["containers"]:
+                container_name = container_data["name"]
+
+                log_file, log_file_contents = self._find_contents_of_any_log_file(
+                    config, pod_namespace, pod_id, container_name)
+
+                if log_file:
+                    return f"PodId: {pod_id}, ContainerName: {container_name}, " \
+                        f"File: {log_file}, Contents: {log_file_contents}"
+
+        return None
+
+    def _find_all_pods(self, config):
+        pods_raw = self.event.session.get(
+            f"{self.base_url}/{KubeletHandlers.PODS.value}", verify=False, timeout=config.network_timeout).text
+
+        if "items" in pods_raw:
+            pods_data = json.loads(pods_raw)["items"]
+            return pods_data
+
+        return None
+
+    def _send_run_request(self, config, pod_namespace, pod_id, container_name, cmd, is_valid_response_func=None):
+        run_url = self.base_url + "/" + KubeletHandlers.RUN.value.format(
+            pod_namespace=pod_namespace,
+            pod_id=pod_id,
+            container_name=container_name,
+            cmd=cmd
+        )
+
+        resp = self.event.session.post(run_url, verify=False, timeout=config.network_timeout).text
+
+        if resp and resp.strip() and (is_valid_response_func(resp) if is_valid_response_func else True):
+            return resp
+
+        return None
+
+    def _find_log_files(self, config, pod_namespace, pod_id, container_name):
+        def is_valid_response(resp):
+            return not any(error in resp for error in ExposedLogsOnContainerFileSystemHunter.FIND_CMD_ERROR_MESSAGES)
+
+        log_files_resp = self._send_run_request(
+            config, pod_namespace, pod_id, container_name, "find /var/log -type f -print", is_valid_response)
+
+        if log_files_resp:
+            return [log_path.strip() for log_path in log_files_resp.split("\n") if log_path and log_path.strip()]
+
+        return None
+
+    def _read_contents_of_file(self, config, pod_namespace, pod_id, container_name, log_file):
+        def is_valid_response(resp):
+            return resp != f"tail: {log_file}: Permission denied"
+
+        log_content_resp = self._send_run_request(
+            config, pod_namespace, pod_id, container_name, f"tail {log_file}", is_valid_response)
+
+        return log_content_resp
+
+    def _find_contents_of_any_log_file(self, config, pod_namespace, pod_id, container_name):
+        log_files_on_container = self._find_log_files(config, pod_namespace, pod_id, container_name)
+
+        if log_files_on_container:
+            for log_file in log_files_on_container:
+                file_contents = self._read_contents_of_file(config, pod_namespace, pod_id, container_name, log_file)
+
+                if file_contents:
+                    return log_file, file_contents
+
+        return None, None
