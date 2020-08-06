@@ -1,14 +1,19 @@
+import json
 import requests
 import requests_mock
 import urllib.parse
 import uuid
 
+from kube_hunter.conf import Config
 from kube_hunter.core.events import handler
+from kube_hunter.core.types import Hunter
 from kube_hunter.modules.hunting.kubelet import (
     AnonymousAuthEnabled,
     ExposedExistingPrivilegedContainersViaSecureKubeletPort,
     ProveAnonymousAuth,
     MaliciousIntentViaSecureKubeletPort,
+    ExposedLogsOnContainerFileSystem,
+    ExposedLogsOnContainerFileSystemHunter,
 )
 
 counter = 0
@@ -721,3 +726,181 @@ def test_maliciousintentviasecurekubeletport_success():
         message += " abused by starting/modifying a process in the host."
 
         assert message in class_being_tested.event.evidence
+
+
+HOST = "TESTHOST"
+PUBLISHED_EVENTS = []
+
+
+@handler.subscribe_once(ExposedLogsOnContainerFileSystem)
+class OnceHunter(Hunter):
+    def __init__(self, event):
+        PUBLISHED_EVENTS.append(event)
+
+
+class TestExposedLogsOnContainerFileSystemHunter:
+    POD_NAMESPACE = "my_namespace"
+    POD_ID = "my_id"
+    CONTAINER_NAME = "my_c_name"
+
+    class DummyEvent:
+        def __init__(self):
+            self.host = HOST
+            self.session = requests.session()
+
+    HUNTER = ExposedLogsOnContainerFileSystemHunter(DummyEvent())
+    CONFIG = Config()
+
+    def test__init__(self):
+        assert self.HUNTER.base_url == f"https://{HOST}:10250"
+
+    def test_find_all_pods(self):
+        scenarios = {
+            json.dumps({"should": "ignore"}): None,
+            json.dumps({"items": [1, 2]}): [1, 2]
+        }
+
+        for scenario, expected_result in scenarios.items():
+            with requests_mock.Mocker() as mock:
+                mock.get(f"https://{HOST}:10250/pods", text=scenario)
+
+                result = self.HUNTER._find_all_pods(self.CONFIG)
+                assert result == expected_result
+
+    def test_send_run_request(self):
+        cmd = "my_cmd"
+
+        def return_false(s):
+            return False
+
+        def return_true(s):
+            return True
+
+        scenarios = {
+            ("", None): None,
+            ("   ", None): None,
+            ("Some String", None): "Some String",
+            ("Some String", return_false): None,
+            ("Some String", return_true): "Some String",
+        }
+
+        for scenario, expected_result in scenarios.items():
+            with requests_mock.Mocker() as mock:
+                mock.post(f"https://{HOST}:10250/run/{self.POD_NAMESPACE}/{self.POD_ID}/{self.CONTAINER_NAME}?"
+                          f"cmd={cmd}", text=scenario[0])
+
+                result = self.HUNTER._send_run_request(
+                    config=self.CONFIG,
+                    pod_namespace=self.POD_NAMESPACE,
+                    pod_id=self.POD_ID,
+                    container_name=self.CONTAINER_NAME,
+                    cmd=cmd,
+                    is_valid_response_func=scenario[1])
+
+                assert result == expected_result
+
+    def test_find_log_files(self):
+        cmd = "find /var/log -type f -print"
+
+        scenarios = {
+            "": None,
+            " No such file or directory ": None,
+            " file1.log \n  file2.log \n  ": ["file1.log", "file2.log"]
+        }
+
+        for scenario, expected_result in scenarios.items():
+            with requests_mock.Mocker() as mock:
+                mock.post(f"https://{HOST}:10250/run/{self.POD_NAMESPACE}/{self.POD_ID}/{self.CONTAINER_NAME}?"
+                          f"cmd={cmd}", text=scenario)
+
+                result = self.HUNTER._find_log_files(self.CONFIG, self.POD_NAMESPACE, self.POD_ID, self.CONTAINER_NAME)
+                assert result == expected_result
+
+    def test_read_contents_of_file(self):
+        log = "my.log"
+        cmd = f"tail {log}"
+
+        scenarios = {
+            "": None,
+            f"tail: {log}: Permission denied": None,
+            "This text was in the file": "This text was in the file"
+        }
+
+        for scenario, expected_result in scenarios.items():
+            with requests_mock.Mocker() as mock:
+                mock.post(f"https://{HOST}:10250/run/{self.POD_NAMESPACE}/{self.POD_ID}/{self.CONTAINER_NAME}?"
+                          f"cmd={cmd}", text=scenario)
+
+                result = self.HUNTER._read_contents_of_file(
+                    self.CONFIG, self.POD_NAMESPACE, self.POD_ID, self.CONTAINER_NAME, log_file=log)
+                assert result == expected_result
+
+    def test_find_contents_of_any_log_file_with_no_logs(self):
+        with requests_mock.Mocker() as mock:
+            mock.post(
+                f"https://{HOST}:10250/run/{self.POD_NAMESPACE}/{self.POD_ID}/{self.CONTAINER_NAME}?"
+                f"cmd=find /var/log -type f -print",
+                text="exited with 126")
+
+            assert self.HUNTER._find_contents_of_any_log_file(
+                self.CONFIG, self.POD_NAMESPACE, self.POD_ID, self.CONTAINER_NAME) == (None, None)
+
+    def test_find_contents_of_any_log_file(self):
+        with requests_mock.Mocker() as mock:
+            mock.post(
+                f"https://{HOST}:10250/run/{self.POD_NAMESPACE}/{self.POD_ID}/{self.CONTAINER_NAME}?"
+                f"cmd=find /var/log -type f -print",
+                text="log1.log\nlog2.log")
+
+            mock.post(
+                f"https://{HOST}:10250/run/{self.POD_NAMESPACE}/{self.POD_ID}/{self.CONTAINER_NAME}?"
+                f"cmd=tail log1.log",
+                text="tail: log1.log: Permission denied")
+
+            mock.post(
+                f"https://{HOST}:10250/run/{self.POD_NAMESPACE}/{self.POD_ID}/{self.CONTAINER_NAME}?"
+                f"cmd=tail log2.log",
+                text="This is the contents of of the file")
+
+            assert self.HUNTER._find_contents_of_any_log_file(
+                self.CONFIG, self.POD_NAMESPACE, self.POD_ID, self.CONTAINER_NAME) == \
+                ("log2.log", "This is the contents of of the file")
+
+    def test_execute(self):
+        PUBLISHED_EVENTS.clear()
+        assert len(PUBLISHED_EVENTS) == 0
+
+        pods_data = [
+            # Should Ignore As No Containers
+            {"metadata": {"namespace": "namespace_1", "name": "pod_id_1"}, "spec": {"containers": []}},
+
+            # Should find the logs in container_2
+            {"metadata": {"namespace": f"{self.POD_NAMESPACE}", "name": f"{self.POD_ID}"}, "spec": {
+                "containers": [{"name": "container_1"}, {"name": "container_2"}]}},
+
+            # Should ignore as we've already found a log in the above container
+            {"metadata": {"namespace": f"{self.POD_NAMESPACE}_2", "name": f"{self.POD_ID}_2"}, "spec": {
+                "containers": [{"name": "container_3"}, {"name": "container_4"}]}},
+        ]
+
+        with requests_mock.Mocker() as mock:
+            mock.get(f"https://{HOST}:10250/pods", text=json.dumps({"items": pods_data}))
+
+            mock.post(f"https://{HOST}:10250/run/{self.POD_NAMESPACE}/{self.POD_ID}/" +
+                      f"container_1?cmd=find%20/var/log%20-type%20f%20-print", text="")
+            mock.post(f"https://{HOST}:10250/run/{self.POD_NAMESPACE}/{self.POD_ID}/" +
+                      f"container_2?cmd=find%20/var/log%20-type%20f%20-print", text="log1.log \n log2.log")
+
+            mock.post(f"https://{HOST}:10250/run/{self.POD_NAMESPACE}/{self.POD_ID}/container_2?"
+                      f"cmd=tail%20log1.log",
+                      text="tail: log1.log: Permission denied")
+            mock.post(f"https://{HOST}:10250/run/{self.POD_NAMESPACE}/{self.POD_ID}/container_2?"
+                      f"cmd=tail%20log2.log",
+                      text="file contents")
+
+            self.HUNTER.execute()
+
+            assert len(PUBLISHED_EVENTS) == 1
+            assert PUBLISHED_EVENTS[0].vid == "KHV052"
+            assert PUBLISHED_EVENTS[0].evidence == f"PodId: {self.POD_ID}, ContainerName: container_2, " \
+                f"File: log2.log, Contents: file contents"
